@@ -1,6 +1,5 @@
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, HTTPException, status
 
 from dto.models import (
     MCPServerMountRequest,
@@ -15,8 +14,7 @@ from dto.models import (
     ToolListResponse,
     ErrorResponse,
 )
-from db.connection import get_db_session
-from service.mcp_registry_factory import get_registry
+from service.mcp_service import get_registry
 
 router = APIRouter()
 
@@ -37,11 +35,8 @@ async def ping():
         500: {"model": ErrorResponse, "description": "Internal server error"},
     },
 )
-async def mount_server(
-    request: MCPServerMountRequest,
-    db_session: AsyncSession = Depends(get_db_session),
-):
-    registry = await get_registry(db_session)
+async def mount_server(request: MCPServerMountRequest):
+    registry = await get_registry()
     success, tool_count, message = await registry.mount_server(
         config=request.config,
     )
@@ -77,11 +72,10 @@ async def mount_server(
 async def unmount_server(
     server_name: str,
     request: Optional[MCPServerUnmountRequest] = None,
-    db_session: AsyncSession = Depends(get_db_session),
 ):
     tags = request.tags if request else None
 
-    registry = await get_registry(db_session)
+    registry = await get_registry()
     success, disabled_count, message = await registry.unmount_server(server_name, tags)
 
     if not success:
@@ -116,9 +110,8 @@ async def unmount_server(
 async def enable_server(
     server_name: str,
     request: Optional[MCPServerEnableRequest] = None,
-    db_session: AsyncSession = Depends(get_db_session),
 ):
-    registry = await get_registry(db_session)
+    registry = await get_registry()
     tags = request.tags if request else None
     success, enabled_count, message = await registry.enable_server(server_name, tags)
 
@@ -158,11 +151,8 @@ async def enable_server(
         500: {"model": ErrorResponse, "description": "Internal server error"},
     },
 )
-async def remove_server(
-    server_name: str,
-    db_session: AsyncSession = Depends(get_db_session),
-):
-    registry = await get_registry(db_session)
+async def remove_server(server_name: str):
+    registry = await get_registry()
     success, disabled_tool_count, message = await registry.remove_server(server_name)
 
     if not success:
@@ -185,10 +175,8 @@ async def remove_server(
 
 
 @router.get("/mcp/servers", response_model=MCPServerListResponse, tags=["mcp-servers"])
-async def list_servers(
-    db_session: AsyncSession = Depends(get_db_session),
-):
-    registry = await get_registry(db_session)
+async def list_servers():
+    registry = await get_registry()
     servers = await registry.list_servers()
 
     return MCPServerListResponse(
@@ -205,11 +193,8 @@ async def list_servers(
         404: {"model": ErrorResponse, "description": "Server not found"},
     },
 )
-async def get_server(
-    server_name: str,
-    db_session: AsyncSession = Depends(get_db_session),
-):
-    registry = await get_registry(db_session)
+async def get_server(server_name: str):
+    registry = await get_registry()
     info = await registry.get_server_info(server_name)
 
     if not info:
@@ -224,10 +209,8 @@ async def get_server(
     return info
 
 @router.get("/mcp/tools", response_model=ToolListResponse, tags=["mcp-tools"])
-async def list_tools(
-    db_session: AsyncSession = Depends(get_db_session),
-):
-    registry = await get_registry(db_session)
+async def list_tools():
+    registry = await get_registry()
     tools = await registry.list_tools()
 
     return ToolListResponse(
@@ -243,27 +226,21 @@ async def list_tools(
         404: {"model": ErrorResponse, "description": "Tool not found"},
     },
 )
-async def get_tool(
-    tool_name: str,
-    db_session: AsyncSession = Depends(get_db_session),
-):
-    registry = await get_registry(db_session)
-    tools = await registry.list_tools()
+async def get_tool(tool_name: str):
+    registry = await get_registry()
+    tool = await registry.get_tool(tool_name)
 
-    for tool in tools:
-        if tool.name == tool_name:
-            return tool
+    if tool is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "Tool not found", "detail": f"Tool '{tool_name}' not found"},
+        )
 
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail={"error": "Tool not found", "detail": f"Tool '{tool_name}' not found"},
-    )
+    return tool
 
 @router.get("/mcp/status", response_model=MainServerStatusResponse, tags=["mcp-status"])
-async def get_main_server_status(
-    db_session: AsyncSession = Depends(get_db_session),
-):
-    registry = await get_registry(db_session)
+async def get_main_server_status():
+    registry = await get_registry()
     status_info = await registry.get_server_status()
 
     return MainServerStatusResponse(

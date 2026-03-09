@@ -8,7 +8,6 @@ from dto.models import (
     ServerTagInfo,
     ToolInfo,
 )
-from aop_logging import log_method, patch_fastmcp_server
 
 
 class MCPServerRegistry:
@@ -18,13 +17,69 @@ class MCPServerRegistry:
     _server_configs: Dict[str, MCPServerConfig] = {}
     _server_tags: Dict[str, Dict[str, MCPServerStatus]] = {}
     _server_status: Dict[str, MCPServerStatus] = {}
+    _tools_cache: Dict[str, ToolInfo] = {}
 
-    @log_method("MCPServerRegistry")
+    async def refresh_tools_cache(self) -> int:
+        """Fetches all tools from the main server and populates the tools cache.
+        
+        Returns:
+            The number of tools cached.
+        """
+        self._tools_cache.clear()
+        
+        if not self._main_server:
+            return 0
+        
+        tool_set = await self._main_server.list_tools()
+        
+        for tool in tool_set:
+            tool_tags = []
+            if hasattr(tool, "tags") and tool.tags:
+                tool_tags = list(tool.tags)
+            
+            # Determine source server
+            source_server = None
+            for server_name, tags_dict in self._server_tags.items():
+                server_tag_names = set(tags_dict.keys())
+                if any(tag in tool_tags for tag in server_tag_names):
+                    source_server = server_name
+                    break
+            
+            tool_info = ToolInfo(
+                name=tool.name,
+                description=tool.description if hasattr(tool, "description") else None,
+                tags=tool_tags,
+                server_name=source_server,
+            )
+            self._tools_cache[tool.name] = tool_info
+        
+        return len(self._tools_cache)
+
+    async def get_tool(self, name: str) -> Optional[ToolInfo]:
+        """Get a tool by name from cache or by fetching and checking.
+        
+        Args:
+            name: The name of the tool to retrieve.
+            
+        Returns:
+            Optional[ToolInfo] - the tool info if found, None otherwise.
+        """
+        # First check cache
+        if name in self._tools_cache:
+            return self._tools_cache[name]
+        
+        # If cache is empty, try to refresh it
+        if not self._tools_cache:
+            await self.refresh_tools_cache()
+            if name in self._tools_cache:
+                return self._tools_cache[name]
+        
+        # If still not found, return None
+        return None
+
     async def initialize_main_server(self, name: str = "main-mcp-server") -> FastMCP:
         if self._main_server is None:
             self._main_server = FastMCP(name=name)
-            # Patch for AOP logging
-            self._main_server = patch_fastmcp_server(self._main_server)
         return self._main_server
 
     async def get_main_server(self) -> Optional[FastMCP]:
@@ -60,7 +115,6 @@ class MCPServerRegistry:
 
         return sorted(list(tags))
 
-    @log_method("MCPServerRegistry")
     async def mount_server(self, config: MCPServerConfig) -> tuple[bool, int, str]:
         if config.server_name in self._mounted_servers:
             return False, 0, f"Server '{config.server_name}' is already mounted"
@@ -86,6 +140,16 @@ class MCPServerRegistry:
             tool_set = await sub_server.list_tools()
             # Count tools in the sub-server
             tool_count = len(tool_set)
+
+            # Add server_name as a tag to all tools in the sub_server
+            # This ensures disable(tags=server_name) works correctly
+            for tool in tool_set:
+                if hasattr(tool, 'tags') and tool.tags:
+                    if config.server_name not in tool.tags:
+                        tool.tags = list(tool.tags) + [config.server_name]
+                else:
+                    tool.tags = [config.server_name]
+
             # Mount to main server
             if self._main_server:
                 self._main_server.mount(sub_server)
@@ -100,6 +164,9 @@ class MCPServerRegistry:
             }
             self._server_status[config.server_name] = MCPServerStatus.ACTIVE
 
+            # Refresh tools cache after mounting
+            await self.refresh_tools_cache()
+
             return (
                 True,
                 tool_count,
@@ -111,7 +178,6 @@ class MCPServerRegistry:
         except Exception as e:
             return False, 0, f"Failed to mount server: {str(e)}"
 
-    @log_method("MCPServerRegistry")
     async def unmount_server(
         self, server_name: str, tags: Optional[List[str]] = None
     ) -> tuple[bool, int, str]:
@@ -119,19 +185,30 @@ class MCPServerRegistry:
             return False, 0, f"Server '{server_name}' is not mounted"
 
         try:
-            # Get all tags for this server
+            # Get all tags for this server from _server_tags (OpenAPI-derived tags)
             server_tags = self._server_tags.get(server_name, {})
-
-            # Get tags to disable
+            
+            # If specific tags are provided, use ONLY those tags
+            # Otherwise, use all OpenAPI-derived tags (or fall back to server_name)
             if tags:
                 tags_to_disable = set(tags)
+                # Validate that all specified tags exist for this server
+                invalid_tags = tags_to_disable - set(server_tags.keys()) - {server_name}
+                if invalid_tags:
+                    return False, 0, f"Invalid tags: {invalid_tags}. Available tags: {set(server_tags.keys())}"
+            elif server_tags:
+                tags_to_disable = set(server_tags.keys())
             else:
-                tags_to_disable = set(server_tags.keys()) if server_tags else {server_name}
+                tags_to_disable = {server_name}
 
-            tool_set = await self._main_server.list_tools()
+            # Also add server_name as a tag to ensure all tools are disabled
+            # (some tools might only have server_name tag)
+            tags_to_disable.add(server_name)
+
             # Disable tools with these tags in main server
             disabled_count = 0
             if self._main_server:
+                tool_set = await self._main_server.list_tools()
                 # Count tools with matching tags
                 for tool in tool_set:
                     if hasattr(tool, "tags") and tool.tags:
@@ -156,6 +233,9 @@ class MCPServerRegistry:
             else:
                 self._server_status[server_name] = MCPServerStatus.ACTIVE
 
+            # Refresh tools cache after unmounting
+            await self.refresh_tools_cache()
+
             return (
                 True,
                 disabled_count,
@@ -166,7 +246,6 @@ class MCPServerRegistry:
             self._server_status[server_name] = MCPServerStatus.ERROR
             return False, 0, f"Failed to unmount server: {str(e)}"
 
-    @log_method("MCPServerRegistry")
     async def enable_server(
         self, server_name: str, tags: Optional[List[str]] = None
     ) -> tuple[bool, int, str]:
@@ -176,32 +255,39 @@ class MCPServerRegistry:
         # Get all tags for this server
         server_tags = self._server_tags.get(server_name, {})
 
-        # Check if server/tags are disabled
+        # Determine which tags to enable based on input
+        tags_to_enable: Set[str]
+        
         if tags:
-            # Check if at least one of the specified tags is disabled
+            # If specific tags are provided, use ONLY those tags
             tags_to_check = set(tags)
+            # Validate that all specified tags exist for this server
+            invalid_tags = tags_to_check - set(server_tags.keys()) - {server_name}
+            if invalid_tags:
+                return False, 0, f"Invalid tags: {invalid_tags}. Available tags: {set(server_tags.keys())}"
+            
+            # Check if at least one of the specified tags is disabled
             any_disabled = any(
                 server_tags.get(tag) == MCPServerStatus.DISABLED
                 for tag in tags_to_check
             )
             if not any_disabled:
                 return False, 0, f"Specified tags are not disabled for server '{server_name}'"
+            
+            tags_to_enable = tags_to_check
         else:
             # Check if the entire server is disabled
             if self._server_status.get(server_name) != MCPServerStatus.DISABLED:
                 return False, 0, f"Server '{server_name}' is not disabled"
+            
+            # If no tags specified, enable all tags for this server
+            tags_to_enable = set(server_tags.keys()) if server_tags else {server_name}
 
         try:
-            # Get tags to enable
-            if tags:
-                tags_to_enable = set(tags)
-            else:
-                tags_to_enable = set(server_tags.keys()) if server_tags else {server_name}
-
-            tool_set = await self._main_server.list_tools()
             # Count tools with matching tags
             enabled_count = 0
             if self._main_server:
+                tool_set = await self._main_server.list_tools()
                 for tool in tool_set:
                     if hasattr(tool, "tags") and tool.tags:
                         if any(tag in tags_to_enable for tag in tool.tags):
@@ -223,12 +309,14 @@ class MCPServerRegistry:
             if not any_disabled:
                 self._server_status[server_name] = MCPServerStatus.ACTIVE
 
+            # Refresh tools cache after enabling
+            await self.refresh_tools_cache()
+
             return True, enabled_count, f"Server '{server_name}' enabled successfully"
 
         except Exception as e:
             return False, 0, f"Failed to enable server: {str(e)}"
 
-    @log_method("MCPServerRegistry")
     async def get_server_info(self, server_name: str) -> Optional[MCPServerInfo]:
         if server_name not in self._mounted_servers:
             return None
@@ -264,7 +352,6 @@ class MCPServerRegistry:
             tool_count=tool_count,
         )
 
-    @log_method("MCPServerRegistry")
     async def list_servers(self) -> List[MCPServerInfo]:
         servers = []
         for server_name in self._mounted_servers.keys():
@@ -273,42 +360,14 @@ class MCPServerRegistry:
                 servers.append(info)
         return servers
 
-    @log_method("MCPServerRegistry")
     async def list_tools(self) -> List[ToolInfo]:
-        tools = []
+        # Check if cache is empty, if so refresh it
+        if not self._tools_cache:
+            await self.refresh_tools_cache()
+        
+        # Return the cached list of tools
+        return list(self._tools_cache.values())
 
-        if not self._main_server:
-            return tools
-
-        tool_set = await self._main_server.list_tools()
-        for tool in tool_set:
-            # Get tool tags
-            tool_tags = []
-            if hasattr(tool, "tags") and tool.tags:
-                tool_tags = list(tool.tags)
-
-            # Determine source server
-            source_server = None
-            for server_name, tags_dict in self._server_tags.items():
-                server_tag_names = set(tags_dict.keys())
-                if any(tag in tool_tags for tag in server_tag_names):
-                    source_server = server_name
-                    break
-
-            tools.append(
-                ToolInfo(
-                    name=tool.name,
-                    description=tool.description
-                    if hasattr(tool, "description")
-                    else None,
-                    tags=tool_tags,
-                    server_name=source_server,
-                )
-            )
-
-        return tools
-
-    @log_method("MCPServerRegistry")
     async def get_server_status(self) -> dict:
         tool_set = await self.list_tools()
         total_tools = len(tool_set)
@@ -320,13 +379,12 @@ class MCPServerRegistry:
 
         return {
             "server_name": self._main_server.name if self._main_server else "unknown",
-            "mounted_servers": len(self._mounted_servers),
+            "mounted_servers": active_servers,
             "active_servers": active_servers,
             "total_tools": total_tools,
             "status": "running" if self._main_server else "stopped",
         }
 
-    @log_method("MCPServerRegistry")
     async def remove_server(self, server_name: str) -> tuple[bool, int, str]:
         if server_name not in self._mounted_servers:
             return False, 0, f"Server '{server_name}' is not mounted"
@@ -371,6 +429,9 @@ class MCPServerRegistry:
             del self._server_configs[server_name]
             del self._server_tags[server_name]
             del self._server_status[server_name]
+
+            # Refresh tools cache after removing
+            await self.refresh_tools_cache()
 
             return True, disabled_count, f"Server '{server_name}' removed successfully"
 
