@@ -657,6 +657,7 @@ class MCPServerRegistry:
         # Check if server is mounted in memory
         if server_name not in self._mounted_servers:
             # Check if it exists in database (might be unmounted but in DB)
+            print(f"Checking if server '{server_name}' exists in database")
             result = await self.session.execute(
                 select(MCPServerDB).where(
                     MCPServerDB.server_name == server_name,
@@ -664,7 +665,7 @@ class MCPServerRegistry:
                 )
             )
             server_db = result.scalar_one_or_none()
-            
+            print(f"Found server in database: {server_db}")
             if not server_db:
                 return False, 0, f"Server '{server_name}' is not mounted"
         else:
@@ -676,6 +677,7 @@ class MCPServerRegistry:
                 )
             )
             server_db = result.scalar_one_or_none()
+            print(f"Found server in database: {server_db}")
 
         if not server_db:
             return False, 0, f"Server '{server_name}' not found in database"
@@ -721,13 +723,10 @@ class MCPServerRegistry:
                 client = mounted_server._client
                 if client and hasattr(client, 'aclose'):
                     await client.aclose()
-
-            # Soft delete in database
-            server_db.soft_delete(deleted_by=user_id)
-            
-            # Soft delete tags
+                    
+            await self.session.delete(server_db)
             for tag in server_tags:
-                tag.soft_delete(deleted_by=user_id)
+                await self.session.delete(tag)
 
             await self.session.commit()
 
@@ -880,7 +879,6 @@ class MCPServerRegistry:
                 status=self._map_db_status_to_dto(server_db.status),
                 tool_count=tool_count,
             )
-
 
     async def list_server_tools(self, server_name: str) -> List[ToolInfo]:
             """List tools for a specific server.
