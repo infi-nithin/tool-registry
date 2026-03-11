@@ -1,91 +1,119 @@
+"""Database-backed MCP Server Registry service.
+
+This module provides a refactored MCPServerRegistry that uses PostgreSQL
+for persistence instead of global variables. All server state is stored
+in the database and restored on startup.
+"""
+
+import time
 from typing import Any, Dict, List, Optional, Set
 import httpx
 from fastmcp import FastMCP
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from db.models.mcp_server import MCPServerDB, MCPServerStatus, MCPServerTagDB
 from dto.models import (
     MCPServerConfig,
     MCPServerInfo,
-    MCPServerStatus,
+    MCPServerStatus as MCPServerStatusDTO,
     ServerTagInfo,
     ToolInfo,
 )
 
 
 class MCPServerRegistry:
-    _instance: Optional["MCPServerRegistry"] = None
-    _main_server: Optional[FastMCP] = None
-    _mounted_servers: Dict[str, FastMCP] = {}
-    _server_configs: Dict[str, MCPServerConfig] = {}
-    _server_tags: Dict[str, Dict[str, MCPServerStatus]] = {}
-    _server_status: Dict[str, MCPServerStatus] = {}
-    _tools_cache: Dict[str, ToolInfo] = {}
+    """Database-backed MCP Server Registry.
+    
+    This class replaces the in-memory global variables with PostgreSQL persistence.
+    Server configurations, tags, and status are stored in the database and
+    restored on application startup.
+    
+    Attributes:
+        _session: AsyncSession for database operations
+        _main_server: The main FastMCP server instance
+        _mounted_servers: In-memory cache of mounted FastMCP instances
+        _audit_logger: Audit logging helper
+    
+    Example:
+        >>> async with get_db_session() as session:
+        ...     registry = MCPServerRegistryDB(session)
+        ...     await registry.initialize_main_server()
+        ...     await registry.restore_servers_from_db()
+    """
 
-    async def refresh_tools_cache(self) -> int:
-        """Fetches all tools from the main server and populates the tools cache.
-        
-        Returns:
-            The number of tools cached.
-        """
-        self._tools_cache.clear()
-        
-        if not self._main_server:
-            return 0
-        
-        tool_set = await self._main_server.list_tools()
-        
-        for tool in tool_set:
-            tool_tags = []
-            if hasattr(tool, "tags") and tool.tags:
-                tool_tags = list(tool.tags)
-            
-            # Determine source server
-            source_server = None
-            for server_name, tags_dict in self._server_tags.items():
-                server_tag_names = set(tags_dict.keys())
-                if any(tag in tool_tags for tag in server_tag_names):
-                    source_server = server_name
-                    break
-            
-            tool_info = ToolInfo(
-                name=tool.name,
-                description=tool.description if hasattr(tool, "description") else None,
-                tags=tool_tags,
-                server_name=source_server,
-            )
-            self._tools_cache[tool.name] = tool_info
-        
-        return len(self._tools_cache)
+    def __init__(self, session: AsyncSession):
+        self.session = session
+        self._main_server: Optional[FastMCP] = None
+        self._mounted_servers: Dict[str, FastMCP] = {}
 
-    async def get_tool(self, name: str) -> Optional[ToolInfo]:
-        """Get a tool by name from cache or by fetching and checking.
-        
-        Args:
-            name: The name of the tool to retrieve.
-            
-        Returns:
-            Optional[ToolInfo] - the tool info if found, None otherwise.
-        """
-        # First check cache
-        if name in self._tools_cache:
-            return self._tools_cache[name]
-        
-        # If cache is empty, try to refresh it
-        if not self._tools_cache:
-            await self.refresh_tools_cache()
-            if name in self._tools_cache:
-                return self._tools_cache[name]
-        
-        # If still not found, return None
-        return None
 
     async def initialize_main_server(self, name: str = "main-mcp-server") -> FastMCP:
+        """Initialize the main FastMCP server.
+        
+        Creates the main FastMCP instance and patches it for AOP logging.
+        
+        Args:
+            name: Name for the main MCP server
+            
+        Returns:
+            The initialized FastMCP instance
+        """
         if self._main_server is None:
             self._main_server = FastMCP(name=name)
         return self._main_server
 
     async def get_main_server(self) -> Optional[FastMCP]:
+        """Get the main FastMCP server instance.
+        
+        Returns:
+            The main FastMCP instance or None if not initialized
+        """
         return self._main_server
+    
+    def _map_db_status_to_dto(self, status: MCPServerStatus) -> MCPServerStatusDTO:
+            """Map database status enum to DTO status enum.
+            
+            Args:
+                status: Database MCPServerStatus enum value
+                
+            Returns:
+                DTO MCPServerStatus enum value
+            """
+            status_map = {
+                MCPServerStatus.ACTIVE: MCPServerStatusDTO.ACTIVE,
+                MCPServerStatus.DISABLED: MCPServerStatusDTO.DISABLED,
+                MCPServerStatus.ERROR: MCPServerStatusDTO.ERROR,
+            }
+            return status_map.get(status, MCPServerStatusDTO.ERROR)
+        
+    def _map_dto_status_to_db(self, status: MCPServerStatusDTO) -> MCPServerStatus:
+            """Map DTO status enum to database status enum.
+            
+            Args:
+                status: DTO MCPServerStatus enum value
+                
+            Returns:
+                Database MCPServerStatus enum value
+            """
+            status_map = {
+                MCPServerStatusDTO.ACTIVE: MCPServerStatus.ACTIVE,
+                MCPServerStatusDTO.DISABLED: MCPServerStatus.DISABLED,
+                MCPServerStatusDTO.ERROR: MCPServerStatus.ERROR,
+            }
+            return status_map.get(status, MCPServerStatus.ERROR)
+
 
     def extract_openapi_tags(self, openapi_spec: Dict[str, Any]) -> List[str]:
+        """Extract all tags from an OpenAPI specification.
+        
+        Args:
+            openapi_spec: Parsed OpenAPI specification dictionary
+            
+        Returns:
+            Sorted list of unique tag names
+        """
         tags: Set[str] = set()
 
         root_tags = openapi_spec.get("tags", [])
@@ -116,8 +144,28 @@ class MCPServerRegistry:
         return sorted(list(tags))
 
     async def mount_server(self, config: MCPServerConfig) -> tuple[bool, int, str]:
-        if config.server_name in self._mounted_servers:
-            return False, 0, f"Server '{config.server_name}' is already mounted"
+        """Mount a new MCP server from an OpenAPI specification.
+        
+        Fetches the OpenAPI spec, creates a FastMCP sub-server, mounts it
+        to the main server, and persists the configuration to the database.
+        
+        Args:
+            config: Server configuration including spec_link, base_url, etc.
+        Returns:
+            Tuple of (success: bool, tool_count: int, message: str)
+        """
+        # Check if server already exists in database
+        result = await self.session.execute(
+            select(MCPServerDB).where(
+                MCPServerDB.server_name == config.server_name,
+                MCPServerDB.is_deleted == False
+            )
+        )
+        existing_server = result.scalar_one_or_none()
+
+        if existing_server:
+            if config.server_name in self._mounted_servers:
+                return False, 0, f"Server '{config.server_name}' is already mounted"
 
         try:
             # Fetch OpenAPI spec
@@ -136,37 +184,76 @@ class MCPServerRegistry:
                 client=client,
                 name=config.server_name,
             )
-
+            print(f"Sub-server created: {config.server_name}")
             tool_set = await sub_server.list_tools()
+            print(f"Tools in sub-server '{config.server_name}': {[tool.name for tool in tool_set]}")
             # Count tools in the sub-server
             tool_count = len(tool_set)
 
-            # Add server_name as a tag to all tools in the sub_server
-            # This ensures disable(tags=server_name) works correctly
-            for tool in tool_set:
-                if hasattr(tool, 'tags') and tool.tags:
-                    if config.server_name not in tool.tags:
-                        tool.tags = list(tool.tags) + [config.server_name]
-                else:
-                    tool.tags = [config.server_name]
-
             # Mount to main server
-            if self._main_server:
-                self._main_server.mount(sub_server)
+            print(f"Main server: {self._main_server}")
+            if self._main_server is None:
+                self._main_server = FastMCP(name="Main Server")
+            self._main_server.mount(sub_server)
+            print(f"Mounted '{self._main_server}' to main server")
+            print(f"Mounted Servers: {self._mounted_servers}")
 
-            # Track the mounted server
-            self._mounted_servers[config.server_name] = sub_server
-            self._server_configs[config.server_name] = config
+            # Extract tags from OpenAPI spec
             extracted_tags = self.extract_openapi_tags(openapi_spec) or [config.server_name]
-            # Initialize all tags as ACTIVE
-            self._server_tags[config.server_name] = {
-                tag: MCPServerStatus.ACTIVE for tag in extracted_tags
-            }
-            self._server_status[config.server_name] = MCPServerStatus.ACTIVE
 
-            # Refresh tools cache after mounting
-            await self.refresh_tools_cache()
+            # Persist to database
+            if existing_server:
+                # Update existing server
+                existing_server.spec_link = config.spec_link
+                existing_server.base_url = config.base_url
+                existing_server.description = config.description
+                existing_server.headers = config.headers or {}
+                existing_server.status = MCPServerStatus.ACTIVE
+                existing_server.tool_count = tool_count
+                existing_server.is_deleted = False
+                existing_server.deleted_at = None
+                server_db = existing_server
+            else:
+                # Create new server record
+                server_db = MCPServerDB(
+                    server_name=config.server_name,
+                    spec_link=config.spec_link,
+                    base_url=config.base_url,
+                    description=config.description,
+                    headers=config.headers or {},
+                    status=MCPServerStatus.ACTIVE,
+                    tool_count=tool_count,
+                )
+                self.session.add(server_db)
+            
+            await self.session.flush()  # Get the server ID
 
+            # Create or update tag records
+            for tag_name in extracted_tags:
+                tag_result = await self.session.execute(
+                    select(MCPServerTagDB).where(
+                        MCPServerTagDB.server_id == server_db.id,
+                        MCPServerTagDB.tag_name == tag_name,
+                    )
+                )
+                existing_tag = tag_result.scalar_one_or_none()
+                
+                if existing_tag:
+                    existing_tag.status = MCPServerStatus.ACTIVE
+                    existing_tag.is_deleted = False
+                else:
+                    tag_db = MCPServerTagDB(
+                        server_id=server_db.id,
+                        tag_name=tag_name,
+                        status=MCPServerStatus.ACTIVE,
+                    )
+                    self.session.add(tag_db)
+
+            await self.session.commit()
+
+            # Track the mounted server in memory
+            self._mounted_servers[config.server_name] = sub_server
+            print(f"Mounted Servers after commit: {self._mounted_servers}")
             return (
                 True,
                 tool_count,
@@ -174,68 +261,85 @@ class MCPServerRegistry:
             )
 
         except httpx.HTTPError as e:
+            await self.session.rollback()
             return False, 0, f"Failed to fetch OpenAPI spec: {str(e)}"
         except Exception as e:
+            await self.session.rollback()
             return False, 0, f"Failed to mount server: {str(e)}"
 
     async def unmount_server(
-        self, server_name: str, tags: Optional[List[str]] = None
+        self, 
+        server_name: str, 
+        tags: Optional[List[str]] = None,
+        user_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
     ) -> tuple[bool, int, str]:
-        if server_name not in self._mounted_servers:
-            return False, 0, f"Server '{server_name}' is not mounted"
+        """Unmount/disable tags for an MCP server.
+        
+        Disables the specified tags (or all tags if none specified) in the
+        main FastMCP server and updates the database status.
+        
+        Args:
+            server_name: Name of the server to unmount
+            tags: Optional list of specific tags to disable
+            user_id: Optional user identifier for audit trail
+            correlation_id: Optional correlation ID for request tracing
+            
+        Returns:
+            Tuple of (success: bool, disabled_count: int, message: str)
+        """
+
+        # Get server from database
+        result = await self.session.execute(
+            select(MCPServerDB).where(
+                MCPServerDB.server_name == server_name,
+                MCPServerDB.is_deleted == False
+            ).options(selectinload(MCPServerDB.tags))
+        )
+        server_db = result.scalar_one_or_none()
+        
+        if not server_db:
+            return False, 0, f"Server '{server_name}' not found in database"
 
         try:
-            # Get all tags for this server from _server_tags (OpenAPI-derived tags)
-            server_tags = self._server_tags.get(server_name, {})
+            # Get all tags for this server from database
+            db_tags = {tag.tag_name: tag for tag in server_db.tags if not tag.is_deleted}
             
-            # If specific tags are provided, use ONLY those tags
-            # Otherwise, use all OpenAPI-derived tags (or fall back to server_name)
+            # Determine which tags to disable
             if tags:
                 tags_to_disable = set(tags)
-                # Validate that all specified tags exist for this server
-                invalid_tags = tags_to_disable - set(server_tags.keys()) - {server_name}
-                if invalid_tags:
-                    return False, 0, f"Invalid tags: {invalid_tags}. Available tags: {set(server_tags.keys())}"
-            elif server_tags:
-                tags_to_disable = set(server_tags.keys())
             else:
-                tags_to_disable = {server_name}
+                tags_to_disable = set(db_tags.keys()) if db_tags else {server_name}
 
-            # Also add server_name as a tag to ensure all tools are disabled
-            # (some tools might only have server_name tag)
-            tags_to_disable.add(server_name)
-
-            # Disable tools with these tags in main server
+            # Count tools that will be disabled
             disabled_count = 0
             if self._main_server:
                 tool_set = await self._main_server.list_tools()
-                # Count tools with matching tags
                 for tool in tool_set:
                     if hasattr(tool, "tags") and tool.tags:
                         if any(tag in tags_to_disable for tag in tool.tags):
                             disabled_count += 1
 
-                # Disable the tags
+                # Disable the tags in FastMCP
                 self._main_server.disable(tags=tags_to_disable)
 
-            # Update tag statuses
-            for tag in tags_to_disable:
-                if tag in server_tags:
-                    server_tags[tag] = MCPServerStatus.DISABLED
+            # Update tag statuses in database
+            for tag_name in tags_to_disable:
+                if tag_name in db_tags:
+                    print({db_tags[tag_name].status})
+                    db_tags[tag_name].status = MCPServerStatus.DISABLED
+                    db_tags[tag_name].updated_by = user_id
 
             # Update server status based on whether all tags are disabled
             all_disabled = all(
-                status == MCPServerStatus.DISABLED
-                for status in server_tags.values()
+                tag.status == MCPServerStatus.DISABLED
+                for tag in db_tags.values()
             )
             if all_disabled:
-                self._server_status[server_name] = MCPServerStatus.DISABLED
-            else:
-                self._server_status[server_name] = MCPServerStatus.ACTIVE
+                server_db.status = MCPServerStatus.DISABLED
+            server_db.updated_by = user_id
 
-            # Refresh tools cache after unmounting
-            await self.refresh_tools_cache()
-
+            await self.session.commit()
             return (
                 True,
                 disabled_count,
@@ -243,48 +347,74 @@ class MCPServerRegistry:
             )
 
         except Exception as e:
-            self._server_status[server_name] = MCPServerStatus.ERROR
+            await self.session.rollback()
+            server_db.status = MCPServerStatus.ERROR
+            await self.session.commit()
             return False, 0, f"Failed to unmount server: {str(e)}"
-
+        
     async def enable_server(
-        self, server_name: str, tags: Optional[List[str]] = None
+        self, 
+        server_name: str, 
+        tags: Optional[List[str]] = None,
+        user_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
     ) -> tuple[bool, int, str]:
+        """Enable tags for a previously disabled MCP server.
+        
+        Re-enables the specified tags (or all tags if none specified) in the
+        main FastMCP server and updates the database status.
+        
+        Args:
+            server_name: Name of the server to enable
+            tags: Optional list of specific tags to enable
+            user_id: Optional user identifier for audit trail
+            correlation_id: Optional correlation ID for request tracing
+            
+        Returns:
+            Tuple of (success: bool, enabled_count: int, message: str)
+        """
+        start_time = time.time()
+        
+        # Check if server is mounted in memory
         if server_name not in self._mounted_servers:
             return False, 0, f"Server '{server_name}' is not mounted"
 
-        # Get all tags for this server
-        server_tags = self._server_tags.get(server_name, {})
-
-        # Determine which tags to enable based on input
-        tags_to_enable: Set[str]
+        # Get server from database
+        result = await self.session.execute(
+            select(MCPServerDB).where(
+                MCPServerDB.server_name == server_name,
+                MCPServerDB.is_deleted == False
+            ).options(selectinload(MCPServerDB.tags))
+        )
+        server_db = result.scalar_one_or_none()
         
+        if not server_db:
+            return False, 0, f"Server '{server_name}' not found in database"
+
+        # Get all tags for this server
+        db_tags = {tag.tag_name: tag for tag in server_db.tags if not tag.is_deleted}
+
+        # Check if server/tags are disabled
         if tags:
-            # If specific tags are provided, use ONLY those tags
             tags_to_check = set(tags)
-            # Validate that all specified tags exist for this server
-            invalid_tags = tags_to_check - set(server_tags.keys()) - {server_name}
-            if invalid_tags:
-                return False, 0, f"Invalid tags: {invalid_tags}. Available tags: {set(server_tags.keys())}"
-            
-            # Check if at least one of the specified tags is disabled
             any_disabled = any(
-                server_tags.get(tag) == MCPServerStatus.DISABLED
+                db_tags.get(tag) and db_tags[tag].status == MCPServerStatus.DISABLED
                 for tag in tags_to_check
             )
             if not any_disabled:
                 return False, 0, f"Specified tags are not disabled for server '{server_name}'"
-            
-            tags_to_enable = tags_to_check
         else:
-            # Check if the entire server is disabled
-            if self._server_status.get(server_name) != MCPServerStatus.DISABLED:
+            if server_db.status != MCPServerStatus.DISABLED:
                 return False, 0, f"Server '{server_name}' is not disabled"
-            
-            # If no tags specified, enable all tags for this server
-            tags_to_enable = set(server_tags.keys()) if server_tags else {server_name}
 
         try:
-            # Count tools with matching tags
+            # Determine which tags to enable
+            if tags:
+                tags_to_enable = set(tags)
+            else:
+                tags_to_enable = set(db_tags.keys()) if db_tags else {server_name}
+
+            # Count tools that will be enabled
             enabled_count = 0
             if self._main_server:
                 tool_set = await self._main_server.list_tools()
@@ -296,125 +426,293 @@ class MCPServerRegistry:
                 # Re-enable in main server
                 self._main_server.enable(tags=tags_to_enable)
 
-            # Update tag statuses
-            for tag in tags_to_enable:
-                if tag in server_tags:
-                    server_tags[tag] = MCPServerStatus.ACTIVE
+            # Update tag statuses in database
+            for tag_name in tags_to_enable:
+                if tag_name in db_tags:
+                    db_tags[tag_name].status = MCPServerStatus.ACTIVE
+                    db_tags[tag_name].updated_by = user_id
 
-            # Check if there are still disabled tags for this server
-            any_disabled = any(
-                status == MCPServerStatus.DISABLED
-                for status in server_tags.values()
-            )
-            if not any_disabled:
-                self._server_status[server_name] = MCPServerStatus.ACTIVE
+            # Update server status
+            server_db.status = MCPServerStatus.ACTIVE
+            server_db.updated_by = user_id
 
-            # Refresh tools cache after enabling
-            await self.refresh_tools_cache()
-
+            await self.session.commit()
             return True, enabled_count, f"Server '{server_name}' enabled successfully"
 
         except Exception as e:
+            await self.session.rollback()
             return False, 0, f"Failed to enable server: {str(e)}"
 
-    async def get_server_info(self, server_name: str) -> Optional[MCPServerInfo]:
-        if server_name not in self._mounted_servers:
-            return None
-
-        config = self._server_configs.get(server_name)
-        if not config:
-            return None
-
-        # Get server tags with their statuses
-        server_tags = self._server_tags.get(server_name, {})
-        tag_info_list = [
-            ServerTagInfo(tag_name=tag_name, status=status)
-            for tag_name, status in server_tags.items()
-        ]
-
-        # Count tools for this server
-        tool_count = 0
-        server_tag_names = set(server_tags.keys())
-        tool_set = await self._main_server.list_tools()
-        if self._main_server:
-            for tool in tool_set:
-                if hasattr(tool, "tags") and tool.tags:
-                    if any(tag in server_tag_names for tag in tool.tags):
-                        tool_count += 1
-
-        return MCPServerInfo(
-            server_name=config.server_name,
-            spec_link=config.spec_link,
-            base_url=config.base_url,
-            description=config.description,
-            tags=tag_info_list,
-            status=self._server_status.get(server_name),
-            tool_count=tool_count,
+    async def disable_server(
+        self, 
+        server_name: str, 
+        tags: Optional[List[str]] = None,
+        user_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+    ) -> tuple[bool, int, str]:
+        """Disable an MCP server (alias for unmount_server).
+        
+        This is a convenience method that provides a clearer naming convention
+        for disabling servers without fully removing them.
+        
+        Args:
+            server_name: Name of the server to disable
+            tags: Optional list of specific tags to disable
+            user_id: Optional user identifier for audit trail
+            correlation_id: Optional correlation ID for request tracing
+            
+        Returns:
+            Tuple of (success: bool, disabled_count: int, message: str)
+        """
+        return await self.unmount_server(
+            server_name=server_name,
+            tags=tags,
+            user_id=user_id,
+            correlation_id=correlation_id,
         )
 
-    async def list_servers(self) -> List[MCPServerInfo]:
-        servers = []
-        for server_name in self._mounted_servers.keys():
-            info = await self.get_server_info(server_name)
-            if info:
-                servers.append(info)
-        return servers
+    async def list_servers(
+            self, 
+            status_filter: Optional[MCPServerStatus] = None,
+            include_deleted: bool = False,
+        ) -> List[MCPServerInfo]:
+            """List all MCP servers.
+            
+            Args:
+                status_filter: Optional filter by server status
+                include_deleted: Whether to include soft-deleted servers
+                
+            Returns:
+                List of MCPServerInfo DTOs
+            """
+            query = select(MCPServerDB).options(selectinload(MCPServerDB.tags))
+            
+            if not include_deleted:
+                query = query.where(MCPServerDB.is_deleted == False)
+            
+            if status_filter:
+                query = query.where(MCPServerDB.status == status_filter)
+            
+            result = await self.session.execute(query)
+            servers = result.scalars().all()
+            
+            server_info_list = []
+            for server_db in servers:
+                info = await self._build_server_info_from_db(server_db)
+                if info:
+                    server_info_list.append(info)
+            
+            return server_info_list
+
+    async def _build_server_info_from_db(self, server_db: MCPServerDB) -> Optional[MCPServerInfo]:
+            """Build MCPServerInfo DTO from database model.
+            
+            Args:
+                server_db: MCPServerDB database model instance
+                
+            Returns:
+                MCPServerInfo DTO or None
+            """
+            # Build tag info list
+            tag_info_list = [
+                ServerTagInfo(
+                    tag_name=tag.tag_name,
+                    status=self._map_db_status_to_dto(tag.status)
+                )
+                for tag in server_db.tags
+                if not tag.is_deleted
+            ]
+
+            # Count tools for this server
+            tool_count = 0
+            server_tag_names = {tag.tag_name for tag in server_db.tags if not tag.is_deleted}
+            
+            if self._main_server:
+                tool_set = await self._main_server.list_tools()
+                for tool in tool_set:
+                    if hasattr(tool, "tags") and tool.tags:
+                        if any(tag in server_tag_names for tag in tool.tags):
+                            tool_count += 1
+
+            return MCPServerInfo(
+                server_name=server_db.server_name,
+                spec_link=server_db.spec_link,
+                base_url=server_db.base_url,
+                description=server_db.description,
+                tags=tag_info_list,
+                status=self._map_db_status_to_dto(server_db.status),
+                tool_count=tool_count,
+            )
 
     async def list_tools(self) -> List[ToolInfo]:
-        # Check if cache is empty, if so refresh it
-        if not self._tools_cache:
-            await self.refresh_tools_cache()
-        
-        # Return the cached list of tools
-        return list(self._tools_cache.values())
+            """List all tools from all mounted servers.
+            
+            Returns:
+                List of ToolInfo DTOs
+            """
+            tools = []
+            print("554")
+            print(f"Main server: {self._mounted_servers}")
+            if not self._main_server:
+                return tools
+            print("557")
+            tool_set = await self._main_server.list_tools()
+            print("559")
+            # Get all servers with their tags from database
+            result = await self.session.execute(
+                select(MCPServerDB).where(
+                    MCPServerDB.is_deleted == False
+                ).options(selectinload(MCPServerDB.tags))
+            )
+            servers = result.scalars().all()
+            print("567")
+            # Build a map of tag -> server_name
+            tag_to_server: Dict[str, str] = {}
+            for server in servers:
+                for tag in server.tags:
+                    if not tag.is_deleted:
+                        tag_to_server[tag.tag_name] = server.server_name
+
+            for tool in tool_set:
+                # Get tool tags
+                tool_tags = []
+                if hasattr(tool, "tags") and tool.tags:
+                    tool_tags = list(tool.tags)
+
+                # Determine source server
+                source_server = None
+                for tag in tool_tags:
+                    if tag in tag_to_server:
+                        source_server = tag_to_server[tag]
+                        break
+
+                tools.append(
+                    ToolInfo(
+                        name=tool.name,
+                        description=tool.description
+                        if hasattr(tool, "description")
+                        else None,
+                        tags=tool_tags,
+                        server_name=source_server,
+                    )
+                )
+            print("598")
+            return tools
 
     async def get_server_status(self) -> dict:
+        """Get overall registry status.
+        
+        Returns:
+            Dictionary with server statistics
+        """
         tool_set = await self.list_tools()
         total_tools = len(tool_set)
-        active_servers = sum(
-            1
-            for status in self._server_status.values()
-            if status == MCPServerStatus.ACTIVE
+        
+        # Count active servers from database
+        result = await self.session.execute(
+            select(MCPServerDB).where(
+                MCPServerDB.status == MCPServerStatus.ACTIVE,
+                MCPServerDB.is_deleted == False
+            )
         )
+        active_servers = len(result.scalars().all())
+        
+        # Count total servers from database
+        result = await self.session.execute(
+            select(MCPServerDB).where(MCPServerDB.is_deleted == False)
+        )
+        total_servers = len(result.scalars().all())
+        print(f"Total servers: {self._mounted_servers}")
 
         return {
             "server_name": self._main_server.name if self._main_server else "unknown",
-            "mounted_servers": active_servers,
+            "mounted_servers": len(self._mounted_servers),
+            "total_servers": total_servers,
             "active_servers": active_servers,
             "total_tools": total_tools,
             "status": "running" if self._main_server else "stopped",
         }
 
-    async def remove_server(self, server_name: str) -> tuple[bool, int, str]:
+    async def remove_server(
+        self, 
+        server_name: str,
+        user_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+    ) -> tuple[bool, int, str]:
+        """Remove an MCP server (soft delete).
+        
+        Performs a soft delete in the database and removes the server
+        from the in-memory FastMCP instance.
+        
+        Args:
+            server_name: Name of the server to remove
+            user_id: Optional user identifier for audit trail
+            correlation_id: Optional correlation ID for request tracing
+            
+        Returns:
+            Tuple of (success: bool, disabled_count: int, message: str)
+        """
+        start_time = time.time()
+        
+        # Check if server is mounted in memory
         if server_name not in self._mounted_servers:
-            return False, 0, f"Server '{server_name}' is not mounted"
+            # Check if it exists in database (might be unmounted but in DB)
+            result = await self.session.execute(
+                select(MCPServerDB).where(
+                    MCPServerDB.server_name == server_name,
+                    MCPServerDB.is_deleted == False
+                )
+            )
+            server_db = result.scalar_one_or_none()
+            
+            if not server_db:
+                return False, 0, f"Server '{server_name}' is not mounted"
+        else:
+            # Get server from database
+            result = await self.session.execute(
+                select(MCPServerDB).where(
+                    MCPServerDB.server_name == server_name,
+                    MCPServerDB.is_deleted == False
+                )
+            )
+            server_db = result.scalar_one_or_none()
+
+        if not server_db:
+            return False, 0, f"Server '{server_name}' not found in database"
 
         disabled_count = 0
         try:
             # First disable/unmount if active
-            if self._server_status.get(server_name) == MCPServerStatus.ACTIVE:
-                success, disabled_count, msg = await self.unmount_server(server_name)
+            if server_db.status == MCPServerStatus.ACTIVE:
+                success, disabled_count, msg = await self.unmount_server(
+                    server_name=server_name,
+                    user_id=user_id,
+                    correlation_id=correlation_id,
+                )
                 if not success:
                     return False, disabled_count, msg
 
             # Get all tags for this server before removal
-            server_tags = self._server_tags.get(server_name, {})
-            tags_to_enable = set(server_tags.keys()) if server_tags else {server_name}
+            result = await self.session.execute(
+                select(MCPServerTagDB).where(
+                    MCPServerTagDB.server_id == server_db.id,
+                    MCPServerTagDB.is_deleted == False
+                )
+            )
+            server_tags = result.scalars().all()
+            tags_to_enable = {tag.tag_name for tag in server_tags} if server_tags else {server_name}
 
             # Enable the tags before removing the provider to clear disabled state
-            # This ensures that if the server is remounted, the tools will be visible
             if self._main_server:
                 self._main_server.enable(tags=tags_to_enable)
 
             # Properly unmount from main server by removing the provider
             if self._main_server and hasattr(self._main_server, 'providers'):
-                # Find and remove the provider for this server
                 providers = self._main_server.providers
                 for i, provider in enumerate(providers):
                     if hasattr(provider, 'server') and hasattr(provider.server, 'name'):
                         if provider.server.name == server_name:
                             providers.pop(i)
-                            print(f"Removed provider for server '{server_name}'")
                             break
 
             # Get the mounted server and close its client if it has one
@@ -424,61 +722,175 @@ class MCPServerRegistry:
                 if client and hasattr(client, 'aclose'):
                     await client.aclose()
 
-            # Remove from tracking
-            del self._mounted_servers[server_name]
-            del self._server_configs[server_name]
-            del self._server_tags[server_name]
-            del self._server_status[server_name]
+            # Soft delete in database
+            server_db.soft_delete(deleted_by=user_id)
+            
+            # Soft delete tags
+            for tag in server_tags:
+                tag.soft_delete(deleted_by=user_id)
 
-            # Refresh tools cache after removing
-            await self.refresh_tools_cache()
+            await self.session.commit()
 
+            # Remove from in-memory cache
+            if server_name in self._mounted_servers:
+                del self._mounted_servers[server_name]
             return True, disabled_count, f"Server '{server_name}' removed successfully"
 
         except Exception as e:
+            await self.session.rollback()
             return False, disabled_count, f"Failed to remove server: {str(e)}"
 
+    async def restore_servers_from_db(self) -> tuple[int, List[str]]:
+        """Restore all ACTIVE servers from the database on startup.
+        
+        Queries all servers with ACTIVE status from the database and
+        re-mounts them to the FastMCP main server.
+        
+        Returns:
+            Tuple of (restored_count: int, errors: List[str])
+        """
+        if not self._main_server:
+            raise RuntimeError("Main server must be initialized before restoring servers")
 
-# Global registry instance
-_registry: Optional[MCPServerRegistry] = None
+        # Query all active servers from database
+        result = await self.session.execute(
+            select(MCPServerDB).where(
+                MCPServerDB.status == MCPServerStatus.ACTIVE,
+                MCPServerDB.is_deleted == False
+            ).options(selectinload(MCPServerDB.tags))
+        )
+        servers = result.scalars().all()
+
+        restored_count = 0
+        errors = []
+
+        for server_db in servers:
+            try:
+                # Create config from database record
+                config = MCPServerConfig(
+                    server_name=server_db.server_name,
+                    spec_link=server_db.spec_link,
+                    base_url=server_db.base_url,
+                    description=server_db.description,
+                    headers=server_db.headers or {},
+                )
+
+                # Fetch OpenAPI spec
+                response = httpx.get(config.spec_link, timeout=30.0)
+                response.raise_for_status()
+                openapi_spec = response.json()
+
+                # Create async client
+                client = httpx.AsyncClient(
+                    base_url=config.base_url, headers=config.headers or {}
+                )
+
+                # Create FastMCP server from OpenAPI spec
+                sub_server = FastMCP.from_openapi(
+                    openapi_spec=openapi_spec,
+                    client=client,
+                    name=config.server_name,
+                )
+
+                # Mount to main server
+                self._main_server.mount(sub_server)
+
+                # Check tag statuses and disable if needed
+                disabled_tags = {
+                    tag.tag_name for tag in server_db.tags
+                    if tag.status == MCPServerStatus.DISABLED and not tag.is_deleted
+                }
+                if disabled_tags:
+                    self._main_server.disable(tags=disabled_tags)
+
+                # Track the mounted server
+                self._mounted_servers[config.server_name] = sub_server
+                restored_count += 1
+
+            except Exception as e:
+                error_msg = f"Failed to restore server '{server_db.server_name}': {str(e)}"
+                errors.append(error_msg)
+                # Update server status to ERROR in database
+                server_db.status = MCPServerStatus.ERROR
+                await self.session.commit()
+
+        return restored_count, errors
+
+    async def get_server(self, server_name: str) -> Optional[MCPServerInfo]:
+        """Get server information by name.
+        
+        Alias for get_server_info for API compatibility.
+        
+        Args:
+            server_name: Name of the server to get
+            
+        Returns:
+            MCPServerInfo DTO or None if not found
+        """
+        return await self.get_server_info(server_name)
+
+    async def get_server_info(self, server_name: str) -> Optional[MCPServerInfo]:
+            """Get information about a mounted MCP server.
+            
+            Args:
+                server_name: Name of the server to get info for
+                
+            Returns:
+                MCPServerInfo DTO or None if server not found
+            """
+            # Get server from database
+            result = await self.session.execute(
+                select(MCPServerDB).where(
+                    MCPServerDB.server_name == server_name,
+                    MCPServerDB.is_deleted == False
+                ).options(selectinload(MCPServerDB.tags))
+            )
+            server_db = result.scalar_one_or_none()
+            
+            if not server_db:
+                return None
+
+            # Build tag info list
+            tag_info_list = [
+                ServerTagInfo(
+                    tag_name=tag.tag_name,
+                    status=self._map_db_status_to_dto(tag.status)
+                )
+                for tag in server_db.tags
+                if not tag.is_deleted
+            ]
+
+            # Count tools for this server
+            tool_count = 0
+            server_tag_names = {tag.tag_name for tag in server_db.tags if not tag.is_deleted}
+            
+            if self._main_server:
+                tool_set = await self._main_server.list_tools()
+                for tool in tool_set:
+                    if hasattr(tool, "tags") and tool.tags:
+                        if any(tag in server_tag_names for tag in tool.tags):
+                            tool_count += 1
+
+            return MCPServerInfo(
+                server_name=server_db.server_name,
+                spec_link=server_db.spec_link,
+                base_url=server_db.base_url,
+                description=server_db.description,
+                tags=tag_info_list,
+                status=self._map_db_status_to_dto(server_db.status),
+                tool_count=tool_count,
+            )
 
 
-async def get_registry() -> MCPServerRegistry:
-    global _registry
-    if _registry is None:
-        _registry = MCPServerRegistry()
-    return _registry
+    async def list_server_tools(self, server_name: str) -> List[ToolInfo]:
+            """List tools for a specific server.
+            
+            Args:
+                server_name: Name of the server to get tools for
+                
+            Returns:
+                List of ToolInfo DTOs for the specified server
+            """
+            all_tools = await self.list_tools()
+            return [tool for tool in all_tools if tool.server_name == server_name]
 
-
-async def initialize_main_server(name: str = "main-mcp-server") -> FastMCP:
-    registry = await get_registry()
-    return await registry.initialize_main_server(name)
-
-
-async def get_main_server() -> Optional[FastMCP]:
-    registry = await get_registry()
-    return await registry.get_main_server()
-
-
-async def mount_mcp_server(config: MCPServerConfig) -> tuple[bool, int, str]:
-    registry = await get_registry()
-    return await registry.mount_server(config)
-
-
-async def unmount_mcp_server(
-    server_name: str, tags: Optional[List[str]] = None
-) -> tuple[bool, int, str]:
-    registry = await get_registry()
-    return await registry.unmount_server(server_name, tags)
-
-
-async def enable_mcp_server(
-    server_name: str, tags: Optional[List[str]] = None
-) -> tuple[bool, int, str]:
-    registry = await get_registry()
-    return await registry.enable_server(server_name, tags)
-
-
-async def remove_mcp_server(server_name: str) -> tuple[bool, int, str]:
-    registry = await get_registry()
-    return await registry.remove_server(server_name)

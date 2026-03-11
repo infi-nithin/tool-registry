@@ -3,8 +3,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.v1 import endpoints
-from service.mcp_service import get_registry, initialize_main_server
+from db.startup import initialize_database, restore_mcp_servers, close_database
+from db.connection import get_db_session
+import logging
 
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
@@ -17,27 +20,46 @@ async def combined_lifespan(app: FastAPI):
     registry = None
     
     try:
-        # Step 1: Initialize main server
-        print("Initializing main MCP server...")
-        main_server = await initialize_main_server(name="main-mcp-server")
-        print(f"Main MCP server initialized: {main_server.name}")
+        # Step 1: Initialize database
+        logger.info("Initializing database...")
+        db_initialized = await initialize_database()
+        if not db_initialized:
+            logger.error("Database initialization failed - application may not function correctly")
+        else:
+            logger.info("Database initialized successfully")
         
-        # Step 2: Get the registry
-        registry = await get_registry()
+        # Step 2: Restore MCP servers from database
+        logger.info("Restoring MCP servers from database...")
+        restored_count, errors = await restore_mcp_servers(server_name="main-mcp-server")
+        logger.info(f"Restored {restored_count} MCP servers from database")
+        if errors:
+            for error in errors:
+                logger.warning(f"Server restoration error: {error}")
         
-        # Step 3: Create and mount the MCP HTTP app
-        try:
-            mcp_http_app = main_server.http_app(path="/", transport="streamable-http")
-            # Enter MCP lifespan to initialize the task group
-            mcp_context = mcp_http_app.lifespan(mcp_http_app)
-            await mcp_context.__aenter__()
-            # Mount the MCP app now that lifespan is active
-            app.mount("/mcp", mcp_http_app)
-            print("MCP HTTP endpoint mounted at /mcp")
-        except Exception as e:
-            print(f"Warning: Could not setup MCP HTTP endpoint: {e}")
-            import traceback
-            traceback.print_exc()
+        # Step 3: Get the registry and main server for HTTP app mounting
+        from service.mcp_registry_factory import get_registry
+        from db.connection import async_session_factory
+        
+        if async_session_factory:
+            async with async_session_factory() as session:
+                registry = await get_registry(session)
+                main_server = await registry.get_main_server()
+                
+                if main_server:
+                    logger.info(f"Main MCP server initialized: {main_server.name}")
+                    # Create and mount the MCP HTTP app
+                    try:
+                        mcp_http_app = main_server.http_app(path="/", transport="streamable-http")
+                        # Enter MCP lifespan to initialize the task group
+                        mcp_context = mcp_http_app.lifespan(mcp_http_app)
+                        await mcp_context.__aenter__()
+                        # Mount the MCP app now that lifespan is active
+                        app.mount("/mcp", mcp_http_app)
+                        logger.info("MCP HTTP endpoint mounted at /mcp")
+                    except Exception as e:
+                        logger.error(f"Warning: Could not setup MCP HTTP endpoint: {e}")
+                        import traceback
+                        traceback.print_exc()
         
         yield
         
@@ -46,9 +68,14 @@ async def combined_lifespan(app: FastAPI):
         if mcp_context:
             try:
                 await mcp_context.__aexit__(None, None, None)
-                print("MCP lifespan exited successfully")
+                logger.info("MCP lifespan exited successfully")
             except Exception as e:
-                print(f"Error during MCP lifespan exit: {e}")
+                logger.error(f"Error during MCP lifespan exit: {e}")
+        
+        # Cleanup database resources
+        logger.info("Closing database connections...")
+        await close_database()
+        logger.info("Database connections closed")
 
 
 def create_application() -> FastAPI:

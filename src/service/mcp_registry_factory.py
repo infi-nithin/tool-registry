@@ -1,142 +1,92 @@
-"""MCP Server Registry Factory.
+"""
+MCP Server Registry Factory.
 
-This module provides a factory pattern for creating and managing
-MCPServerRegistry instances with in-memory storage.
+Provides a singleton MCPServerRegistry instance while allowing
+request-scoped database sessions.
 """
 
 import asyncio
 from typing import Optional
+from contextlib import asynccontextmanager
 
+from sqlalchemy.ext.asyncio import AsyncSession
 from service.mcp_service import MCPServerRegistry
 
 
 class MCPRegistryFactory:
-    """Factory for creating and managing MCP Server Registry instances.
-
-    Provides centralized management of registry instances with proper
-    lifecycle management. Uses singleton pattern for in-memory storage.
-
-    Attributes:
-        _registry: Singleton registry instance
-        _lock: Async lock for thread-safe operations
-    """
+    """Singleton factory for MCPServerRegistry."""
 
     def __init__(self):
-        """Initialize the factory with an empty registry cache."""
         self._registry: Optional[MCPServerRegistry] = None
         self._lock = asyncio.Lock()
 
-    async def get_registry(self) -> MCPServerRegistry:
-        """Get or create a registry instance.
-
-        Creates a new MCPServerRegistry instance if one doesn't exist,
-        otherwise returns the cached instance.
-
-        Returns:
-            MCPServerRegistry instance
+    async def get_registry(self, session: AsyncSession) -> MCPServerRegistry:
         """
+        Return the global registry instance and attach the current DB session.
+        """
+
         async with self._lock:
+
+            # Create registry only once
             if self._registry is None:
-                self._registry = MCPServerRegistry()
+                self._registry = MCPServerRegistry(session)
+                await self._registry.initialize_main_server()
+
+            # Inject session for current request
+            self._registry.session = session
+
             return self._registry
 
-    async def create_registry(self) -> MCPServerRegistry:
-        """Create a new registry instance regardless of cache.
-
-        Use this method when you need a fresh registry instance
-        even if one exists.
-
-        Returns:
-            New MCPServerRegistry instance
-        """
-        async with self._lock:
-            self._registry = MCPServerRegistry()
-        return self._registry
-
-    def release_registry(self) -> bool:
-        """Release the registry instance from the cache.
-
-        Returns:
-            True if a registry was found and removed, False otherwise
-        """
-        if self._registry is not None:
-            self._registry = None
-            return True
-        return False
-
-    async def clear_cache(self) -> int:
-        """Clear the cached registry instance.
-
-        Returns:
-            Number of registry instances that were cleared (0 or 1)
-        """
-        async with self._lock:
-            count = 1 if self._registry is not None else 0
-            self._registry = None
-            return count
-
-    def get_cached_count(self) -> int:
-        """Get the number of cached registry instances.
-
-        Returns:
-            Number of registry instances currently in cache (0 or 1)
-        """
-        return 1 if self._registry is not None else 0
-
-
-# Global factory instance for convenience
+# Global factory
 _factory: Optional[MCPRegistryFactory] = None
 
-
 def get_factory() -> MCPRegistryFactory:
-    """Get the global MCP registry factory instance.
-
-    Returns:
-        The global MCPRegistryFactory instance (creates one if needed)
-    """
+    """Return global MCP registry factory."""
     global _factory
+
     if _factory is None:
         _factory = MCPRegistryFactory()
+
     return _factory
 
 
-async def get_registry() -> MCPServerRegistry:
-    """Get a registry instance using the global factory.
-
-    Convenience function that uses the global factory to get
-    or create a registry instance.
-
-    Returns:
-        MCPServerRegistry instance
-
-    Example:
-        >>> registry = await get_registry()
-        >>> servers = await registry.list_servers()
-    """
+async def get_registry(session: AsyncSession) -> MCPServerRegistry:
+    """Convenience helper used inside API routes."""
     factory = get_factory()
-    return await factory.get_registry()
+    return await factory.get_registry(session)
+
+
+@asynccontextmanager
+async def registry_context(session: AsyncSession):
+    """Context manager for registry usage."""
+    registry = await get_registry(session)
+
+    try:
+        yield registry
+    finally:
+        pass
 
 
 async def initialize_registry_with_main_server(
+    session: AsyncSession,
     server_name: str = "main-mcp-server",
+    restore_servers: bool = True,
 ) -> MCPServerRegistry:
-    """Initialize a registry with main server.
-
-    Convenience function for full registry initialization.
-
-    Args:
-        server_name: Name for the main MCP server
-
-    Returns:
-        Fully initialized MCPServerRegistry instance
-
-    Example:
-        >>> registry = await initialize_registry_with_main_server()
-        >>> # Registry is ready to use with main server initialized
     """
-    registry = await get_registry()
+    Initialize registry during application startup.
+    """
 
-    # Initialize main server
+    factory = get_factory()
+    registry = await factory.get_registry(session)
+
     await registry.initialize_main_server(name=server_name)
+
+    if restore_servers:
+        restored_count, errors = await registry.restore_servers_from_db()
+
+        print(f"Restored {restored_count} MCP servers")
+
+        for error in errors:
+            print(f"Warning: {error}")
 
     return registry
