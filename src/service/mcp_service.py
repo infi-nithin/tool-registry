@@ -681,7 +681,6 @@ class MCPServerRegistry:
         # First check in-memory data
         config = self._server_configs.get(server_name)
         server_tags = self._server_tags.get(server_name, {})
-        server_status = self._server_status.get(server_name)
         
         # If not in memory, try to get from database
         if not config:
@@ -701,7 +700,6 @@ class MCPServerRegistry:
                             description=db_server.description,
                         )
                         server_tags = {tag.tag_name: MCPServerStatus.ACTIVE if tag.status == MCPServerStatusEnum.ACTIVE else MCPServerStatus.DISABLED for tag in db_server.tags}
-                        server_status = MCPServerStatus.ACTIVE if db_server.status == MCPServerStatusEnum.ACTIVE else MCPServerStatus.DISABLED
             except Exception:
                 pass
         

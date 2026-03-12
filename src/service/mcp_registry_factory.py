@@ -1,9 +1,3 @@
-"""MCP Server Registry Factory.
-
-This module provides a factory pattern for creating and managing
-MCPServerRegistry instances with in-memory storage.
-"""
-
 import asyncio
 from typing import Optional
 

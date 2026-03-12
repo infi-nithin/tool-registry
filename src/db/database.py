@@ -1,9 +1,3 @@
-"""Database connection and session management.
-
-This module provides async SQLAlchemy engine and session factory
-for database operations using Alembic for migrations.
-"""
-
 import os
 import logging
 from typing import AsyncGenerator, Optional
@@ -36,11 +30,11 @@ def get_database_url() -> str:
         return url
 
     # Construct from components
-    host = os.getenv("DB_HOST", "localhost")
-    port = os.getenv("DB_PORT", "5432")
-    name = os.getenv("DB_NAME", "tool_registry")
-    user = os.getenv("DB_USER", "tool_registry_user")
-    password = os.getenv("DB_PASSWORD", "your_secure_password")
+    host = os.getenv("DB_HOST")
+    port = os.getenv("DB_PORT")
+    name = os.getenv("DB_NAME")
+    user = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
 
     return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{name}"
 

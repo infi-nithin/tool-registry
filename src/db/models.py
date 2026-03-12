@@ -1,9 +1,3 @@
-"""Database models for MCP Server Registry.
-
-This module contains SQLAlchemy models that map to the database tables
-for persisting MCP server configurations and audit logs.
-"""
-
 from datetime import datetime
 from typing import Optional, Dict, Any
 from sqlalchemy import (
