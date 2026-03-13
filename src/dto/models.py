@@ -23,12 +23,16 @@ class MCPServerMountRequest(BaseModel):
 
 class MCPServerUnmountRequest(BaseModel):
     server_name: str = Field(..., description="Name of the server to unmount")
-    tags: Optional[List[str]] = Field(None, description="Tags to disable (if empty, disables all)")
+    tags: Optional[List[str]] = Field(
+        None, description="Tags to disable (if empty, disables all)"
+    )
 
 
 class MCPServerEnableRequest(BaseModel):
     server_name: str = Field(..., description="Name of the server to enable")
-    tags: Optional[List[str]] = Field(None, description="Tags to enable (if empty, enables all)")
+    tags: Optional[List[str]] = Field(
+        None, description="Tags to enable (if empty, enables all)"
+    )
 
 
 class ServerTagInfo(BaseModel):
@@ -76,7 +80,9 @@ class ToolInfo(BaseModel):
     name: str
     description: Optional[str]
     tags: List[str]
-    server_name: Optional[str] = Field(None, description="Source server name if from a mounted server")
+    server_name: Optional[str] = Field(
+        None, description="Source server name if from a mounted server"
+    )
 
 
 class ToolListResponse(BaseModel):

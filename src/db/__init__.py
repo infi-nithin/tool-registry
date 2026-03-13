@@ -1,9 +1,3 @@
-"""Database package for MCP Server Registry.
-
-This package contains database models, connection management,
-and session handling for PostgreSQL persistence.
-"""
-
 from .models import (
     Base,
     MCPServer,

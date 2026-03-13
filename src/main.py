@@ -8,23 +8,19 @@ from service.mcp_service import get_registry, initialize_main_server
 
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
-    """Application lifespan manager for MCP server initialization.
-    
-    Handles MCP server startup and cleanup on shutdown.
-    """
     mcp_context = None
     mcp_http_app = None
     registry = None
-    
+
     try:
         # Step 1: Initialize main server
         print("Initializing main MCP server...")
         main_server = await initialize_main_server(name="main-mcp-server")
         print(f"Main MCP server initialized: {main_server.name}")
-        
+
         # Step 2: Get the registry
         registry = await get_registry()
-        
+
         # Step 3: Create and mount the MCP HTTP app
         try:
             mcp_http_app = main_server.http_app(path="/", transport="streamable-http")
@@ -37,10 +33,11 @@ async def combined_lifespan(app: FastAPI):
         except Exception as e:
             print(f"Warning: Could not setup MCP HTTP endpoint: {e}")
             import traceback
+
             traceback.print_exc()
-        
+
         yield
-        
+
     finally:
         # Exit MCP lifespan if it was entered
         if mcp_context:
@@ -91,4 +88,5 @@ app = create_application()
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

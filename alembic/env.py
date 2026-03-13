@@ -1,9 +1,3 @@
-"""Alembic environment configuration.
-
-This module configures the Alembic migration environment,
-connecting it to the SQLAlchemy models and database.
-"""
-
 import asyncio
 from logging.config import fileConfig
 

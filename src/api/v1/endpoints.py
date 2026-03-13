@@ -170,7 +170,7 @@ async def remove_server(server_name: str):
         success=True,
         server_name=server_name,
         message=message,
-        disabled_tools_count=disabled_tool_count
+        disabled_tools_count=disabled_tool_count,
     )
 
 
@@ -208,6 +208,7 @@ async def get_server(server_name: str):
 
     return info
 
+
 @router.get("/mcp/tools", response_model=ToolListResponse, tags=["mcp-tools"])
 async def list_tools():
     registry = await get_registry()
@@ -217,6 +218,7 @@ async def list_tools():
         tools=tools,
         total_count=len(tools),
     )
+
 
 @router.get(
     "/mcp/tools/{tool_name}",
@@ -233,10 +235,14 @@ async def get_tool(tool_name: str):
     if tool is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "Tool not found", "detail": f"Tool '{tool_name}' not found"},
+            detail={
+                "error": "Tool not found",
+                "detail": f"Tool '{tool_name}' not found",
+            },
         )
 
     return tool
+
 
 @router.get("/mcp/status", response_model=MainServerStatusResponse, tags=["mcp-status"])
 async def get_main_server_status():
