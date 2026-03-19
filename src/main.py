@@ -1,9 +1,22 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
 from api.v1 import endpoints
 from service.mcp_service import get_registry, initialize_main_server
+from aop_logging import get_aop_logger, patch_fastmcp_server
+import asyncio
+import sys
+import logging
+from aop_logging import AOPLoggingMiddleware, RequestTimingMiddleware
+
+# Configure root logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+    ],
+)
 
 
 @asynccontextmanager
@@ -11,13 +24,17 @@ async def combined_lifespan(app: FastAPI):
     mcp_context = None
     mcp_http_app = None
     registry = None
+    logger = get_aop_logger().logger
 
     try:
         # Step 1: Initialize main server
-        print("Initializing main MCP server...")
+        logger.info("Initializing main MCP server...")
+        logger.info("Current logger handlers before MCP initialization:")
         main_server = await initialize_main_server(name="main-mcp-server")
-        print(f"Main MCP server initialized: {main_server.name}")
-
+        logger.disabled = False
+        main_server = patch_fastmcp_server(main_server)
+        logger.info("MCP server patched with AOP logging")
+        logger.info(f"Main MCP server initialized: {main_server}")
         # Step 2: Get the registry
         registry = await get_registry()
 
@@ -29,23 +46,18 @@ async def combined_lifespan(app: FastAPI):
             await mcp_context.__aenter__()
             # Mount the MCP app now that lifespan is active
             app.mount("/mcp", mcp_http_app)
-            print("MCP HTTP endpoint mounted at /mcp")
+            logger.info("MCP HTTP endpoint mounted at /mcp")
         except Exception as e:
-            print(f"Warning: Could not setup MCP HTTP endpoint: {e}")
-            import traceback
-
-            traceback.print_exc()
+            logger.warning(f"Warning: Could not setup MCP HTTP endpoint: {e}")
 
         yield
-
     finally:
-        # Exit MCP lifespan if it was entered
         if mcp_context:
             try:
                 await mcp_context.__aexit__(None, None, None)
-                print("MCP lifespan exited successfully")
+                logger.info("MCP lifespan exited successfully")
             except Exception as e:
-                print(f"Error during MCP lifespan exit: {e}")
+                logger.error(f"Error during MCP lifespan exit: {e}")
 
 
 def create_application() -> FastAPI:
@@ -55,6 +67,9 @@ def create_application() -> FastAPI:
         version="0.1.0",
         lifespan=combined_lifespan,
     )
+
+    app.add_middleware(AOPLoggingMiddleware)
+    app.add_middleware(RequestTimingMiddleware)
 
     app.add_middleware(
         CORSMiddleware,
@@ -89,4 +104,4 @@ app = create_application()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)

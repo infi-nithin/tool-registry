@@ -18,7 +18,9 @@ from db.models import (
     MCPServerStatusEnum,
     AuditActionEnum,
 )
+from aop_logging.aop_logger import log_method
 from db.database import get_session_context, init_db
+
 
 
 class MCPServerRegistry:
@@ -170,7 +172,9 @@ class MCPServerRegistry:
                 return self._tools_cache[name]
         return None
 
+    @log_method("MCPServerRegistry")
     async def initialize_main_server(self, name: str = "main-mcp-server") -> FastMCP:
+        print(f"Initializing main MCP server: {name}")
         if self._main_server is None:
             self._main_server = FastMCP(name=name)
             await self._load_from_database()
@@ -206,6 +210,7 @@ class MCPServerRegistry:
                     tags.update(operation_tags)
         return sorted(list(tags))
 
+    @log_method("MCPServerRegistry")
     async def mount_server(self, config: MCPServerConfig) -> tuple[bool, int, str]:
         await self._ensure_db_initialized()
         if config.server_name in self._mounted_servers:
@@ -276,7 +281,8 @@ class MCPServerRegistry:
             return False, 0, f"Failed to fetch OpenAPI spec: {str(e)}"
         except Exception as e:
             return False, 0, f"Failed to mount server: {str(e)}"
-
+        
+    @log_method("MCPServerRegistry")
     async def unmount_server(
         self, server_name: str, tags: Optional[List[str]] = None
     ) -> tuple[bool, int, str]:
@@ -368,6 +374,7 @@ class MCPServerRegistry:
             self._server_status[server_name] = MCPServerStatus.ERROR
             return False, 0, f"Failed to unmount server: {str(e)}"
 
+    @log_method("MCPServerRegistry")
     async def enable_server(
         self, server_name: str, tags: Optional[List[str]] = None
     ) -> tuple[bool, int, str]:
@@ -516,6 +523,7 @@ class MCPServerRegistry:
         except Exception as e:
             return False, 0, f"Failed to enable server: {str(e)}"
 
+    @log_method("MCPServerRegistry")
     async def get_server_info(self, server_name: str) -> Optional[MCPServerInfo]:
         config = self._server_configs.get(server_name)
         server_tags = self._server_tags.get(server_name, {})
@@ -569,7 +577,7 @@ class MCPServerRegistry:
             status=self._server_status.get(server_name),
             tool_count=tool_count,
         )
-
+    @log_method("MCPServerRegistry")
     async def list_servers(self) -> List[MCPServerInfo]:
         servers = []
         server_names = set(self._mounted_servers.keys())
@@ -589,11 +597,13 @@ class MCPServerRegistry:
                 servers.append(info)
         return servers
 
+    @log_method("MCPServerRegistry")
     async def list_tools(self) -> List[ToolInfo]:
         if not self._tools_cache:
             await self.refresh_tools_cache()
         return list(self._tools_cache.values())
 
+    
     async def get_server_status(self) -> dict:
         await self._ensure_db_initialized()
         total_tools = 0
@@ -622,6 +632,8 @@ class MCPServerRegistry:
             "status": "running" if self._main_server else "stopped",
         }
 
+
+    @log_method("MCPServerRegistry")
     async def remove_server(self, server_name: str) -> tuple[bool, int, str]:
         await self._ensure_db_initialized()
         if server_name not in self._mounted_servers:
@@ -722,7 +734,6 @@ async def get_registry() -> MCPServerRegistry:
     if _registry is None:
         _registry = MCPServerRegistry()
     return _registry
-
 
 async def initialize_main_server(name: str = "main-mcp-server") -> FastMCP:
     registry = await get_registry()

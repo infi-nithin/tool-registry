@@ -46,21 +46,18 @@ async def run_alembic_migrations() -> None:
         os.path.join(project_root, "alembic.ini"),
         os.path.join(os.getcwd(), "alembic.ini"),
     ]
-
     alembic_ini_path = None
     for path in possible_paths:
         normalized = os.path.normpath(path)
         if os.path.exists(normalized):
             alembic_ini_path = normalized
             break
-
     if alembic_ini_path:
         alembic_cfg = Config(alembic_ini_path)
         # Ensure the script location is absolute
         alembic_cfg.set_main_option(
             "script_location", os.path.join(project_root, "alembic")
         )
-
         # Run Alembic upgrade synchronously
         command.upgrade(alembic_cfg, "head")
     else:
@@ -75,21 +72,18 @@ async def init_db(
     global engine, async_session_factory
 
     db_url = get_database_url()
-
     engine = create_async_engine(
         db_url,
         pool_size=pool_size,
         max_overflow=max_overflow,
         poolclass=AsyncAdaptedQueuePool,
     )
-
     async_session_factory = async_sessionmaker(
         engine,
         class_=AsyncSession,
         expire_on_commit=False,
         autoflush=False,
     )
-
     # Run Alembic migrations to create tables
     if run_migrations:
         try:
@@ -97,7 +91,6 @@ async def init_db(
         except Exception:
             # Don't fail - tables might already exist
             pass
-
     return engine
 
 
