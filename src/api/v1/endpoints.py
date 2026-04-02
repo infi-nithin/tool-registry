@@ -211,9 +211,12 @@ async def get_server(server_name: str):
 
 @router.get("/mcp/tools", response_model=ToolListResponse, tags=["mcp-tools"])
 async def list_tools():
+    print("214")
     registry = await get_registry()
+    print("216")
     tools = await registry.list_tools()
-
+    print("218")
+    print(tools)
     return ToolListResponse(
         tools=tools,
         total_count=len(tools),

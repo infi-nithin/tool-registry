@@ -18,6 +18,7 @@ from db.models import (
     MCPServerStatusEnum,
     AuditActionEnum,
 )
+from aop_logging import log_method
 from db.database import get_session_context, init_db
 
 
@@ -206,6 +207,7 @@ class MCPServerRegistry:
                     tags.update(operation_tags)
         return sorted(list(tags))
 
+    @log_method("MCPServerRegistry")
     async def mount_server(self, config: MCPServerConfig) -> tuple[bool, int, str]:
         await self._ensure_db_initialized()
         if config.server_name in self._mounted_servers:
@@ -277,6 +279,7 @@ class MCPServerRegistry:
         except Exception as e:
             return False, 0, f"Failed to mount server: {str(e)}"
 
+    @log_method("MCPServerRegistry")
     async def unmount_server(
         self, server_name: str, tags: Optional[List[str]] = None
     ) -> tuple[bool, int, str]:
@@ -368,6 +371,7 @@ class MCPServerRegistry:
             self._server_status[server_name] = MCPServerStatus.ERROR
             return False, 0, f"Failed to unmount server: {str(e)}"
 
+    @log_method("MCPServerRegistry")
     async def enable_server(
         self, server_name: str, tags: Optional[List[str]] = None
     ) -> tuple[bool, int, str]:
@@ -570,6 +574,7 @@ class MCPServerRegistry:
             tool_count=tool_count,
         )
 
+    @log_method("MCPServerRegistry")
     async def list_servers(self) -> List[MCPServerInfo]:
         servers = []
         server_names = set(self._mounted_servers.keys())
@@ -589,11 +594,13 @@ class MCPServerRegistry:
                 servers.append(info)
         return servers
 
+    @log_method("MCPServerRegistry")
     async def list_tools(self) -> List[ToolInfo]:
         if not self._tools_cache:
             await self.refresh_tools_cache()
         return list(self._tools_cache.values())
 
+    @log_method("MCPServerRegistry")
     async def get_server_status(self) -> dict:
         await self._ensure_db_initialized()
         total_tools = 0
@@ -622,6 +629,7 @@ class MCPServerRegistry:
             "status": "running" if self._main_server else "stopped",
         }
 
+    @log_method("MCPServerRegistry")
     async def remove_server(self, server_name: str) -> tuple[bool, int, str]:
         await self._ensure_db_initialized()
         if server_name not in self._mounted_servers:

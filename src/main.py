@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.v1 import endpoints
 from service.mcp_service import get_registry, initialize_main_server
+from aop_logging import AOPLoggingMiddleware, RequestTimingMiddleware
+from aop_logging import get_aop_logger
 
 
 @asynccontextmanager
@@ -11,12 +13,12 @@ async def combined_lifespan(app: FastAPI):
     mcp_context = None
     mcp_http_app = None
     registry = None
-
+    logger = get_aop_logger().logger
     try:
         # Step 1: Initialize main server
-        print("Initializing main MCP server...")
+        logger.info("Initializing main MCP server...")
         main_server = await initialize_main_server(name="main-mcp-server")
-        print(f"Main MCP server initialized: {main_server.name}")
+        logger.info(f"Main MCP server initialized: {main_server.name}")
 
         # Step 2: Get the registry
         registry = await get_registry()
@@ -29,9 +31,9 @@ async def combined_lifespan(app: FastAPI):
             await mcp_context.__aenter__()
             # Mount the MCP app now that lifespan is active
             app.mount("/mcp", mcp_http_app)
-            print("MCP HTTP endpoint mounted at /mcp")
+            logger.info("MCP HTTP endpoint mounted at /mcp")
         except Exception as e:
-            print(f"Warning: Could not setup MCP HTTP endpoint: {e}")
+            logger.info(f"Warning: Could not setup MCP HTTP endpoint: {e}")
             import traceback
 
             traceback.print_exc()
@@ -43,9 +45,9 @@ async def combined_lifespan(app: FastAPI):
         if mcp_context:
             try:
                 await mcp_context.__aexit__(None, None, None)
-                print("MCP lifespan exited successfully")
+                logger.info("MCP lifespan exited successfully")
             except Exception as e:
-                print(f"Error during MCP lifespan exit: {e}")
+                logger.info(f"Error during MCP lifespan exit: {e}")
 
 
 def create_application() -> FastAPI:
@@ -55,6 +57,9 @@ def create_application() -> FastAPI:
         version="0.1.0",
         lifespan=combined_lifespan,
     )
+
+    app.add_middleware(AOPLoggingMiddleware)
+    app.add_middleware(RequestTimingMiddleware)
 
     app.add_middleware(
         CORSMiddleware,
